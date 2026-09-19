@@ -27,10 +27,12 @@ mp_drawing = mp.solutions.drawing_utils
 
 class VoiceEngine:
     def __init__(self):
-        pass
+        self.speech_lock = threading.Lock()
 
     def trigger_alert(self, message):
         def run_speech():
+            if not self.speech_lock.acquire(blocking=False):
+                return
             try:
                 engine = pyttsx3.init()
                 engine.setProperty('rate', 165)
@@ -40,6 +42,8 @@ class VoiceEngine:
                 engine.stop()
             except Exception as e:
                 print("TTS Engine Error:", e)
+            finally:
+                self.speech_lock.release()
 
         threading.Thread(target=run_speech, daemon=True).start()
 
@@ -1133,7 +1137,10 @@ class PostureApp(ctk.CTk):
 
     def get_face_bounds(self, face_landmarks, frame_width, frame_height):
         points = [
-            (int(landmark.x * frame_width), int(landmark.y * frame_height))
+            (
+                int(np.clip(landmark.x, 0.0, 1.0) * frame_width),
+                int(np.clip(landmark.y, 0.0, 1.0) * frame_height)
+            )
             for landmark in face_landmarks.landmark
         ]
         x_values = [point[0] for point in points]
@@ -1151,13 +1158,24 @@ class PostureApp(ctk.CTk):
 
         frame_height, frame_width = frame.shape[:2]
         x0, y0, x1, y1 = self.get_face_bounds(face_landmarks, frame_width, frame_height)
-        face_width = x1 - x0
-        face_height = y1 - y0
-        if face_width < 2 or face_height < 2:
+        face_width = max(2, x1 - x0)
+        face_height = max(2, y1 - y0)
+        if x1 <= x0 or y1 <= y0:
             return
 
         sticker = cv2.resize(self.sticker_image, (face_width, face_height), interpolation=cv2.INTER_AREA)
-        frame[y0:y1, x0:x1] = sticker
+        mask = np.zeros((face_height, face_width), dtype=np.uint8)
+        center = (face_width // 2, face_height // 2)
+        axes = (max(1, int(face_width * 0.47)), max(1, int(face_height * 0.50)))
+        cv2.ellipse(mask, center, axes, 0, 0, 360, 255, -1, cv2.LINE_AA)
+        mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=2.0)
+
+        roi = frame[y0:y1, x0:x1]
+        if roi.shape[:2] != sticker.shape[:2]:
+            sticker = sticker[:roi.shape[0], :roi.shape[1]]
+            mask = mask[:roi.shape[0], :roi.shape[1]]
+        alpha = (mask.astype(np.float32) / 255.0)[..., None]
+        roi[:] = (sticker.astype(np.float32) * alpha + roi.astype(np.float32) * (1.0 - alpha)).astype(np.uint8)
 
     def update_feed(self):
         if not self.is_running:
