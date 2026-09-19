@@ -7,6 +7,7 @@ import platform
 import threading
 import json
 import webbrowser
+import copy
 from datetime import datetime, date
 import customtkinter as ctk
 from PIL import Image, ImageDraw
@@ -112,11 +113,14 @@ class PostureApp(ctk.CTk):
 
         self.face_mesh = mp_face_mesh.FaceMesh(
             static_image_mode=False,
-            max_num_faces=1,
+            max_num_faces=3,
             refine_landmarks=True,
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5
         )
+
+        self.primary_face_center = None
+        self.sticker_image = self.load_face_sticker()
 
         self.is_tracking = False      
         self.start_time = None
@@ -578,7 +582,24 @@ class PostureApp(ctk.CTk):
         )
         self.info_lbl.pack(pady=(2, 6))
 
-        self.cap = cv2.VideoCapture(0)
+        self.cap = None
+        self.camera_backend = None
+        for backend in (cv2.CAP_DSHOW, cv2.CAP_MSMF, 0):
+            try:
+                cap = cv2.VideoCapture(0, backend)
+                if cap.isOpened():
+                    ok, _ = cap.read()
+                    if ok:
+                        self.cap = cap
+                        self.camera_backend = backend
+                        break
+                cap.release()
+            except Exception:
+                pass
+
+        if self.cap is None or not self.cap.isOpened():
+            self.cap = cv2.VideoCapture(0)
+            self.camera_backend = "default"
 
         self.bind("<Key>", self.handle_keypress)
         self.bind("<Escape>", lambda event: self.on_close())
@@ -932,6 +953,7 @@ class PostureApp(ctk.CTk):
         self.calibrating = True
         self.calibration_start = time.time()
         self.is_tracking = True
+        self.primary_face_center = None
         self.last_active_timestamp = time.time()
 
         if self.start_time is None:
@@ -1063,8 +1085,88 @@ class PostureApp(ctk.CTk):
 
         return canvas
 
+    def get_multi_person_pose_candidates(self, rgb_frame):
+        """Return up to 3 pose candidates from different parts of the frame."""
+        h, w = rgb_frame.shape[:2]
+        candidates = []
+        regions = [
+            (0, 0, w // 3, h),
+            (w // 3, 0, (2 * w) // 3, h),
+            ((2 * w) // 3, 0, w, h),
+        ]
+
+        for x0, y0, x1, y1 in regions:
+            roi = rgb_frame[y0:y1, x0:x1]
+            if roi.size == 0:
+                continue
+
+            roi_result = self.pose.process(roi)
+            if not roi_result.pose_landmarks:
+                continue
+
+            face_adjusted = copy.deepcopy(roi_result.pose_landmarks)
+            roi_w = max(1, x1 - x0)
+            roi_h = max(1, y1 - y0)
+            for landmark in face_adjusted.landmark:
+                landmark.x = (landmark.x * roi_w / w) + (x0 / w)
+                landmark.y = (landmark.y * roi_h / h) + (y0 / h)
+
+            candidates.append(face_adjusted)
+            if len(candidates) >= 3:
+                break
+
+        if not candidates:
+            direct_result = self.pose.process(rgb_frame)
+            if direct_result.pose_landmarks:
+                candidates.append(direct_result.pose_landmarks)
+
+        return candidates
+
+    def load_face_sticker(self):
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        for filename in ("sticker.jpg", "sticker.jpeg", "face_sticker.jpg", "face_sticker.jpeg"):
+            sticker_path = os.path.join(base_dir, filename)
+            sticker = cv2.imread(sticker_path, cv2.IMREAD_COLOR)
+            if sticker is not None:
+                return sticker
+        return None
+
+    def get_face_bounds(self, face_landmarks, frame_width, frame_height):
+        points = [
+            (int(landmark.x * frame_width), int(landmark.y * frame_height))
+            for landmark in face_landmarks.landmark
+        ]
+        x_values = [point[0] for point in points]
+        y_values = [point[1] for point in points]
+        return (
+            max(0, min(x_values)),
+            max(0, min(y_values)),
+            min(frame_width, max(x_values)),
+            min(frame_height, max(y_values)),
+        )
+
+    def overlay_face_sticker(self, frame, face_landmarks):
+        if self.sticker_image is None:
+            return
+
+        frame_height, frame_width = frame.shape[:2]
+        x0, y0, x1, y1 = self.get_face_bounds(face_landmarks, frame_width, frame_height)
+        face_width = x1 - x0
+        face_height = y1 - y0
+        if face_width < 2 or face_height < 2:
+            return
+
+        sticker = cv2.resize(self.sticker_image, (face_width, face_height), interpolation=cv2.INTER_AREA)
+        frame[y0:y1, x0:x1] = sticker
+
     def update_feed(self):
         if not self.is_running:
+            return
+
+        if self.cap is None or not self.cap.isOpened():
+            self.live_health_lbl.configure(text="• Status: Camera unavailable.", text_color="#FCA5A5")
+            self.live_action_lbl.configure(text="• Action: Please connect or allow the webcam and restart the app.", text_color="#EF4444")
+            self.after(200, self.update_feed)
             return
 
         ret, frame = self.cap.read()
@@ -1104,15 +1206,15 @@ class PostureApp(ctk.CTk):
             h, w, _ = frame.shape
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
-            pose_results = self.pose.process(rgb_frame)
+            face_mesh_results = self.face_mesh.process(rgb_frame)
+            pose_candidates = self.get_multi_person_pose_candidates(rgb_frame)
             hands_results = self.hands.process(rgb_frame)
-            _ = self.face_mesh.process(rgb_frame)
 
             if not self.is_tracking:
                 health_text = "System paused. Give a 👍 Thumbs Up or press 'C' to start."
                 preventive_text = "Action: Show 👍 to start tracking."
             else:
-                health_text = "Monitoring posture geometry."
+                health_text = "Monitoring posture geometry for up to 3 people."
                 preventive_text = "Action: Maintain neutral head position and open chest. 👎 to pause."
 
             if hands_results.multi_hand_landmarks:
@@ -1137,66 +1239,113 @@ class PostureApp(ctk.CTk):
                             self.last_gesture_toggle_time = now
                             self.stop_tracking()
 
-            if pose_results.pose_landmarks and self.is_tracking:
-                landmarks = pose_results.pose_landmarks.landmark
+            if self.is_tracking and pose_candidates:
+                pose_count = 0
+                posture_scores = []
 
-                mp_drawing.draw_landmarks(
-                    frame,
-                    pose_results.pose_landmarks,
-                    mp_pose.POSE_CONNECTIONS,
-                    mp_drawing.DrawingSpec(color=(56, 189, 248), thickness=2, circle_radius=2),
-                    mp_drawing.DrawingSpec(color=(241, 245, 249), thickness=2, circle_radius=2)
-                )
-
-                nose = landmarks[mp_pose.PoseLandmark.NOSE]
-                left_ear = landmarks[mp_pose.PoseLandmark.LEFT_EAR]
-                right_ear = landmarks[mp_pose.PoseLandmark.RIGHT_EAR]
-                left_shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER]
-                right_shoulder = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER]
-
-                if left_shoulder.visibility > 0.2 and right_shoulder.visibility > 0.2:
-                    current_ratio = self.analyzer.compute_ratio(
-                        nose, left_ear, right_ear, left_shoulder, right_shoulder
+                for pose_landmarks in pose_candidates:
+                    pose_count += 1
+                    mp_drawing.draw_landmarks(
+                        frame,
+                        pose_landmarks,
+                        mp_pose.POSE_CONNECTIONS,
+                        mp_drawing.DrawingSpec(color=(56, 189, 248), thickness=2, circle_radius=2),
+                        mp_drawing.DrawingSpec(color=(241, 245, 249), thickness=2, circle_radius=2)
                     )
 
-                    if self.calibrating:
-                        if time.time() - self.calibration_start > 1.0:
-                            success = self.analyzer.calibrate(current_ratio)
-                            if success:
-                                self.calibrating = False
-                                self.status_box.configure(
-                                    text="🔴 Tracking Active - Give 👎 to Pause", 
-                                    fg_color="#059669", 
-                                    text_color="#FFFFFF"
-                                )
+                    landmarks = pose_landmarks.landmark
+                    nose = landmarks[mp_pose.PoseLandmark.NOSE]
+                    left_ear = landmarks[mp_pose.PoseLandmark.LEFT_EAR]
+                    right_ear = landmarks[mp_pose.PoseLandmark.RIGHT_EAR]
+                    left_shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER]
+                    right_shoulder = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER]
 
-                    elif self.analyzer.calibrated:
-                        if self.analyzer.is_misaligned(current_ratio):
-                            is_slouching = True
-                            self.stressed_box.configure(border_color="#EF4444")
-                            self.stressed_area_lbl.configure(
-                                text="📍 Main Stressed Area:\n• Cervical spine & upper shoulders"
-                            )
-                            self.possible_problem_lbl.configure(
-                                text="⚠️ Possible Strain Symptoms:\n• Forward neck strain, spinal stiffness & muscle fatigue"
-                            )
-                            
-                            health_text = "Forward head posture/slouching detected!"
-                            preventive_text = "Action: Pull shoulders back and raise chin."
-                            self.play_voice_alert_async("Please align your spine and posture")
-                        else:
-                            self.stressed_box.configure(border_color="#10B981")
-                            self.stressed_area_lbl.configure(
-                                text="📍 Main Stressed Area:\n• Balanced posture — minimal strain"
-                            )
-                            self.possible_problem_lbl.configure(
-                                text="⚠️ Possible Strain Symptoms:\n• Neutral alignment maintained"
-                            )
-                            
-                            health_text = "Spine in neutral geometry."
-                            preventive_text = "Action: Keep chest open and maintain alignment."
-                            self.optimal_time_counter += dt
-                            is_optimal_this_frame = True
+                    if left_shoulder.visibility > 0.2 and right_shoulder.visibility > 0.2:
+                        current_ratio = self.analyzer.compute_ratio(
+                            nose, left_ear, right_ear, left_shoulder, right_shoulder
+                        )
+                        posture_scores.append(current_ratio)
+
+                        if self.calibrating:
+                            if time.time() - self.calibration_start > 1.0:
+                                success = self.analyzer.calibrate(current_ratio)
+                                if success:
+                                    self.calibrating = False
+                                    self.status_box.configure(
+                                        text="🔴 Tracking Active - Give 👎 to Pause",
+                                        fg_color="#059669",
+                                        text_color="#FFFFFF"
+                                    )
+
+                        elif self.analyzer.calibrated:
+                            if self.analyzer.is_misaligned(current_ratio):
+                                is_slouching = True
+                            else:
+                                is_optimal_this_frame = True
+
+                if pose_count > 1:
+                    health_text = f"Monitoring {pose_count} people in frame."
+                    preventive_text = "Action: Check each detected person and keep shoulders level."
+
+                if posture_scores and self.analyzer.calibrated:
+                    avg_ratio = sum(posture_scores) / len(posture_scores)
+                    if avg_ratio > self.analyzer.baseline_ratio + 0.08:
+                        is_slouching = True
+                        self.stressed_box.configure(border_color="#EF4444")
+                        self.stressed_area_lbl.configure(
+                            text="📍 Main Stressed Area:\n• Cervical spine & upper shoulders"
+                        )
+                        self.possible_problem_lbl.configure(
+                            text="⚠️ Possible Strain Symptoms:\n• Forward neck strain, spinal stiffness & muscle fatigue"
+                        )
+                        health_text = "Forward head posture detected across tracked people."
+                        preventive_text = "Action: Pull shoulders back and raise chin."
+                        self.play_voice_alert_async("Please align your spine and posture")
+                    else:
+                        self.stressed_box.configure(border_color="#10B981")
+                        self.stressed_area_lbl.configure(
+                            text="📍 Main Stressed Area:\n• Balanced posture — minimal strain"
+                        )
+                        self.possible_problem_lbl.configure(
+                            text="⚠️ Possible Strain Symptoms:\n• Neutral alignment maintained"
+                        )
+                        health_text = "Spine in neutral geometry across tracked people."
+                        preventive_text = "Action: Keep chest open and maintain alignment."
+                        self.optimal_time_counter += dt
+                        is_optimal_this_frame = True
+
+            if face_mesh_results.multi_face_landmarks:
+                face_landmarks_list = face_mesh_results.multi_face_landmarks
+                face_centers = []
+                for face_landmarks in face_landmarks_list:
+                    x0, y0, x1, y1 = self.get_face_bounds(face_landmarks, w, h)
+                    face_centers.append(((x0 + x1) // 2, (y0 + y1) // 2))
+
+                if self.is_tracking and self.primary_face_center is None:
+                    self.primary_face_center = face_centers[0]
+
+                primary_face_index = None
+                if self.primary_face_center is not None:
+                    primary_face_index = min(
+                        range(len(face_centers)),
+                        key=lambda index: (
+                            (face_centers[index][0] - self.primary_face_center[0]) ** 2
+                            + (face_centers[index][1] - self.primary_face_center[1]) ** 2
+                        )
+                    )
+                    self.primary_face_center = face_centers[primary_face_index]
+
+                for face_index, face_landmarks in enumerate(face_landmarks_list):
+                    if face_index == primary_face_index or self.sticker_image is None:
+                        mp_drawing.draw_landmarks(
+                            frame,
+                            face_landmarks,
+                            mp_face_mesh.FACEMESH_CONTOURS,
+                            landmark_drawing_spec=mp_drawing.DrawingSpec(color=(183, 94, 255), thickness=1, circle_radius=1),
+                            connection_drawing_spec=mp_drawing.DrawingSpec(color=(183, 94, 255), thickness=1, circle_radius=1)
+                        )
+                    else:
+                        self.overlay_face_sticker(frame, face_landmarks)
 
             if self.is_tracking and not self.calibrating:
                 self.second_timer += dt
